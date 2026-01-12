@@ -36,3 +36,5 @@ https://djl-ai.s3.us-east-1.amazonaws.com/publish/vllm/vllm_extensions_package-1
 xgrammar
 flashinfer-python==0.5.2
 lmcache
+mlflow>=3.4.0
+sagemaker-mlflow

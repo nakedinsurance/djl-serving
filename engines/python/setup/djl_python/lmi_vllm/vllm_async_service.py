@@ -31,11 +31,25 @@ from djl_python.properties_manager.vllm_rb_properties import VllmRbProperties
 from djl_python.inputs import Input
 from djl_python.outputs import Output
 from djl_python.encode_decode import decode
-from djl_python.async_utils import handle_streaming_response, create_non_stream_output, _extract_lora_adapter
-from djl_python.async_utils import register_adapter as _register_adapter, update_adapter as _update_adapter, unregister_adapter as _unregister_adapter
-from djl_python.custom_formatter_handling import CustomFormatterHandler, CustomFormatterError
+from djl_python.async_utils import (
+    handle_streaming_response,
+    create_non_stream_output,
+    _extract_lora_adapter,
+)
+from djl_python.async_utils import (
+    register_adapter as _register_adapter,
+    update_adapter as _update_adapter,
+    unregister_adapter as _unregister_adapter,
+)
+from djl_python.custom_formatter_handling import (
+    CustomFormatterHandler,
+    CustomFormatterError,
+)
 from djl_python.custom_handler_service import CustomHandlerService
-from djl_python.rolling_batch.rolling_batch_vllm_utils import create_lora_request, get_lora_request
+from djl_python.rolling_batch.rolling_batch_vllm_utils import (
+    create_lora_request,
+    get_lora_request,
+)
 
 from djl_python.lmi_vllm.request_response_utils import (
     ProcessedRequest,
@@ -48,13 +62,83 @@ from djl_python.lmi_vllm.request_response_utils import (
     lmi_non_stream_output_formatter,
 )
 from djl_python.session_manager import SessionManager
-from djl_python.session_utils import (create_session, close_session,
-                                      get_session,
-                                      session_non_stream_output_formatter)
+from djl_python.session_utils import (
+    create_session,
+    close_session,
+    get_session,
+    session_non_stream_output_formatter,
+)
+from pydantic import BaseModel
+import mlflow
+from mlflow.entities import SpanType
+from functools import wraps
 
 logger = logging.getLogger(__name__)
 
 SESSION_REQUESTS = {"NEW_SESSION": create_session, "CLOSE": close_session}
+
+
+class MlflowProperties(BaseModel):
+    mlflow_tracking_uri: Optional[str] = None
+    mlflow_experiment_name: Optional[str] = None
+
+    def is_configured(self) -> bool:
+        """Check if MLflow has been configured with at least one property."""
+        return (
+            self.mlflow_tracking_uri is not None
+            or self.mlflow_experiment_name is not None
+        )
+
+
+def conditional_mlflow_trace(span_type=SpanType.LLM):
+    """
+    Decorator that conditionally applies mlflow tracing only if MLflow is configured.
+
+    Uses mlflow.start_span() as a context manager to create spans when MLflow
+    properties are configured, otherwise executes the function without tracing.
+
+    Args:
+        span_type: The type of span to create (default: SpanType.LLM)
+
+    Returns:
+        A decorator that conditionally applies mlflow tracing
+    """
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            # Check if MLflow properties are configured
+            if (
+                hasattr(self, "mlflow_properties")
+                and self.mlflow_properties is not None
+            ):
+                if self.mlflow_properties.is_configured():
+                    # Use mlflow.start_span() as a context manager for conditional tracing
+                    # The context manager automatically handles async functions
+                    with mlflow.start_span(
+                        name=func.__name__, span_type=span_type
+                    ) as span:
+                        # Capture function inputs (excluding 'self')
+                        from mlflow.tracing.utils import capture_function_input_args
+
+                        inputs = capture_function_input_args(
+                            func, (self,) + args, kwargs
+                        )
+                        # Remove 'self' from inputs if present
+                        if "self" in inputs:
+                            del inputs["self"]
+                        span.set_inputs(inputs)
+
+                        # Execute the function and capture outputs
+                        result = await func(self, *args, **kwargs)
+                        span.set_outputs(result)
+                        return result
+            # If MLflow is not configured, just call the function normally
+            return await func(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class VLLMHandler(CustomFormatterHandler):
@@ -79,20 +163,18 @@ class VLLMHandler(CustomFormatterHandler):
     async def initialize(self, properties: dict):
         self.hf_configs = HuggingFaceProperties(**properties)
         self.vllm_properties = VllmRbProperties(**properties)
+        self.mlflow_properties = MlflowProperties(**properties)
 
         # Load formatters
         model_dir = properties.get("model_dir", ".")
         try:
             self.load_formatters(model_dir)
         except CustomFormatterError as e:
-            logger.error(
-                f"Failed to initialize due to custom formatter error: {e}")
+            logger.error(f"Failed to initialize due to custom formatter error: {e}")
             raise
 
-        self.vllm_engine_args = self.vllm_properties.get_engine_args(
-            async_engine=True)
-        self.vllm_engine = AsyncLLMEngine.from_engine_args(
-            self.vllm_engine_args)
+        self.vllm_engine_args = self.vllm_properties.get_engine_args(async_engine=True)
+        self.vllm_engine = AsyncLLMEngine.from_engine_args(self.vllm_engine_args)
         self.tokenizer = await self.vllm_engine.get_tokenizer()
 
         model_names = self.vllm_engine_args.served_model_name or "lmi"
@@ -122,8 +204,7 @@ class VLLMHandler(CustomFormatterHandler):
             "assistant",
             request_logger=None,
             chat_template=self.vllm_properties.chat_template,
-            chat_template_content_format=self.vllm_properties.
-            chat_template_content_format,
+            chat_template_content_format=self.vllm_properties.chat_template_content_format,
             enable_auto_tools=self.vllm_properties.enable_auto_tool_choice,
             tool_parser=self.vllm_properties.tool_call_parser,
             reasoning_parser=self.vllm_properties.reasoning_parser,
@@ -143,8 +224,9 @@ class VLLMHandler(CustomFormatterHandler):
         adapter_name = _extract_lora_adapter(raw_request, decoded_payload)
 
         # Apply input formatter
-        decoded_payload = self.apply_input_formatter(decoded_payload,
-                                                     tokenizer=self.tokenizer)
+        decoded_payload = self.apply_input_formatter(
+            decoded_payload, tokenizer=self.tokenizer
+        )
 
         # For TGI streaming responses, the last chunk requires the full generated text to be provided.
         # Streaming completion responses only return deltas, so we need to accumulate chunks and construct
@@ -176,11 +258,20 @@ class VLLMHandler(CustomFormatterHandler):
             stream_output_formatter = vllm_stream_output_formatter
         # TGI request gets mapped to completions
         elif "inputs" in decoded_payload:
-            vllm_request, include_details, include_prompt = convert_lmi_schema_to_completion_request(
-                decoded_payload)
+            vllm_request, include_details, include_prompt = (
+                convert_lmi_schema_to_completion_request(decoded_payload)
+            )
             vllm_invoke_function = self.completion_service.create_completion
-            non_stream_output_formatter = lmi_with_details_non_stream_output_formatter if include_details else lmi_non_stream_output_formatter
-            stream_output_formatter = lmi_with_details_stream_output_formatter if include_details else lmi_stream_output_formatter
+            non_stream_output_formatter = (
+                lmi_with_details_non_stream_output_formatter
+                if include_details
+                else lmi_non_stream_output_formatter
+            )
+            stream_output_formatter = (
+                lmi_with_details_stream_output_formatter
+                if include_details
+                else lmi_stream_output_formatter
+            )
             accumulate_chunks = True
         # chat completions request
         elif "messages" in decoded_payload:
@@ -204,7 +295,8 @@ class VLLMHandler(CustomFormatterHandler):
             stream_output_formatter = vllm_stream_output_formatter
         else:
             raise RuntimeError(
-                "invalid payload. must contain prompt, inputs, or messages")
+                "invalid payload. must contain prompt, inputs, or messages"
+            )
         processed_request = ProcessedRequest(
             vllm_request,
             vllm_invoke_function,
@@ -223,26 +315,30 @@ class VLLMHandler(CustomFormatterHandler):
             logger.fatal("vLLM engine is dead, terminating process")
             kill_process_tree(os.getpid())
 
+    @conditional_mlflow_trace(span_type=SpanType.LLM)
     async def inference(
-            self,
-            inputs: Input) -> Union[Output, AsyncGenerator[Output, None]]:
+        self, inputs: Input
+    ) -> Union[Output, AsyncGenerator[Output, None]]:
         await self.check_health()
         try:
             processed_request = self.preprocess_request(inputs)
         except CustomFormatterError as e:
             logger.exception("Custom formatter failed")
             output = create_non_stream_output(
-                "", error=f"Custom formatter failed: {str(e)}", code=424)
+                "", error=f"Custom formatter failed: {str(e)}", code=424
+            )
             return output
         except Exception as e:
             logger.exception("Input parsing failed")
             output = create_non_stream_output(
-                "", error=f"Input parsing failed: {str(e)}", code=424)
+                "", error=f"Input parsing failed: {str(e)}", code=424
+            )
             return output
 
         # vLLM will extract the adapter from the request object via _maybe_get_adapters()
         response = await processed_request.inference_invoker(
-            processed_request.vllm_request)
+            processed_request.vllm_request
+        )
 
         if isinstance(response, types.AsyncGeneratorType):
             # Apply custom formatter to streaming response
@@ -290,8 +386,7 @@ class VLLMHandler(CustomFormatterHandler):
     async def pin_lora(self, lora_name: str, lora_alias: str):
         lora_request = get_lora_request(lora_name, self.lora_requests)
         loaded = await self.vllm_engine.add_lora(lora_request)
-        return loaded and await self.vllm_engine.pin_lora(
-            lora_request.lora_int_id)
+        return loaded and await self.vllm_engine.pin_lora(lora_request.lora_int_id)
 
 
 custom_service = None
@@ -299,7 +394,7 @@ service = VLLMHandler()
 
 
 async def handle(
-        inputs: Input
+    inputs: Input,
 ) -> Optional[Union[Output, AsyncGenerator[Output, None]]]:
     global custom_service
     # Initialize custom service once
