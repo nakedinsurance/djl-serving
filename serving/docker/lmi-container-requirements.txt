@@ -2,7 +2,7 @@ torch==2.9.0
 autoawq
 torchvision
 peft==0.15.1
-protobuf==4.25.8
+protobuf==7.34.0rc1
 transformers==4.57.1
 hf-transfer
 zstandard
